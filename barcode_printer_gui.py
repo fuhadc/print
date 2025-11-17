@@ -4,6 +4,7 @@ import os
 import sys
 import time
 import re
+import platform
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from tkinter import font as tkfont
@@ -12,8 +13,15 @@ from barcode.writer import ImageWriter
 from PIL import Image, ImageTk
 import io
 
-# Printer configuration
-PRINTER = '/dev/usb/lp0'  # the printer device
+# Printer configuration - platform-specific defaults
+if platform.system() == 'Windows':
+    # Windows: Use printer name or COM port
+    # Examples: "Thermal Printer", "COM3", "LPT1"
+    PRINTER = "Thermal Printer"  # Change to your printer name or COM port
+else:
+    # Linux/Unix: Use device path
+    PRINTER = '/dev/usb/lp0'  # the printer device
+
 DOTS_MM = 8  # printer dots per mm, 8 == 203 dpi
 
 
@@ -48,16 +56,38 @@ class ThermalPrinter:
         self.printer_path = printer_path
         self.dry_run = dry_run
         self.printer = None
+        self.is_windows = platform.system() == 'Windows'
+        self.is_com_port = False
         
         if not self.dry_run:
             try:
-                self.printer = os.open(printer_path, os.O_RDWR)
+                if self.is_windows:
+                    # Check if it's a COM port (e.g., COM1, COM2, COM3)
+                    if printer_path.upper().startswith('COM'):
+                        # For COM ports, we'd need pyserial, but for now use win32print
+                        # Most thermal printers on Windows should be accessed by name
+                        self.is_com_port = True
+                        raise Exception("COM port access requires pyserial. Use printer name instead.")
+                    else:
+                        # Use Windows printer name - will use win32print if available
+                        try:
+                            import win32print
+                            self.win32print = win32print
+                            self.printer_handle = None
+                        except ImportError:
+                            raise Exception("For Windows printing, install pywin32: pip install pywin32")
+                else:
+                    # Linux/Unix: Use device file
+                    self.printer = os.open(printer_path, os.O_RDWR)
             except Exception as e:
                 raise Exception(f"Cannot open printer at {printer_path}: {e}")
     
     def printer_status(self):
         """Get printer status"""
         if self.dry_run:
+            return '@@@@'
+        if self.is_windows:
+            # Windows: Status checking is limited, assume ready
             return '@@@@'
         os.write(self.printer, b"\x1B!S\r\n")
         status = os.read(self.printer, 8)
@@ -66,6 +96,9 @@ class ThermalPrinter:
     def can_print(self):
         """Check if printer is ready"""
         if self.dry_run:
+            return True
+        if self.is_windows:
+            # Windows: Assume printer is ready
             return True
         return re.fullmatch(r'[@BCFPW]@@@', self.printer_status()) is not None
     
@@ -85,11 +118,23 @@ class ThermalPrinter:
         if self.dry_run:
             print(cmd)
         else:
-            os.write(self.printer, cmd.encode('utf-8'))
-            os.write(self.printer, b'\r\n')
+            if self.is_windows:
+                # Windows: Collect commands and send as raw data
+                if not hasattr(self, '_command_buffer'):
+                    self._command_buffer = []
+                self._command_buffer.append(cmd + '\r\n')
+            else:
+                # Linux/Unix: Send directly to device
+                os.write(self.printer, cmd.encode('utf-8'))
+                os.write(self.printer, b'\r\n')
     
     def setup_page(self, config):
         """Setup page dimensions and settings"""
+        # Initialize command buffer for Windows
+        if self.is_windows and not self.dry_run:
+            if not hasattr(self, '_command_buffer'):
+                self._command_buffer = []
+        
         self.command(f'SIZE {config.width_mm} mm,{config.height_mm} mm')
         self.command(f'GAP {config.gap_mm} mm,0 mm')
         self.command('CODEPAGE UTF-8')
@@ -124,10 +169,47 @@ class ThermalPrinter:
         
         # Print the label
         self.command(f'PRINT 1,{config.num_copies}')
+        
+        # On Windows, flush all commands to printer
+        if self.is_windows and not self.dry_run and hasattr(self, '_command_buffer'):
+            self._flush_commands()
+    
+    def _flush_commands(self):
+        """Send buffered commands to Windows printer"""
+        if not hasattr(self, '_command_buffer') or not self._command_buffer:
+            return
+        
+        try:
+            # Get printer handle
+            printer_handle = self.win32print.OpenPrinter(self.printer_path)
+            try:
+                # Start a print job
+                job_info = self.win32print.StartDocPrinter(printer_handle, 1, ("TSPL Print Job", None, "RAW"))
+                try:
+                    self.win32print.StartPagePrinter(printer_handle)
+                    
+                    # Send all buffered commands
+                    all_commands = ''.join(self._command_buffer).encode('utf-8')
+                    self.win32print.WritePrinter(printer_handle, all_commands)
+                    
+                    self.win32print.EndPagePrinter(printer_handle)
+                finally:
+                    self.win32print.EndDocPrinter(printer_handle)
+            finally:
+                self.win32print.ClosePrinter(printer_handle)
+            
+            # Clear buffer
+            self._command_buffer = []
+        except Exception as e:
+            raise Exception(f"Failed to send data to Windows printer: {e}")
     
     def close(self):
         """Close printer connection"""
-        if self.printer is not None:
+        if self.is_windows:
+            # Windows: Commands are already sent via win32print
+            if hasattr(self, '_command_buffer'):
+                self._command_buffer = []
+        elif self.printer is not None:
             os.close(self.printer)
 
 
@@ -356,7 +438,9 @@ class BarcodePrinterGUI:
         row += 1
         
         # Printer Path
-        ttk.Label(controls_frame, text="Printer Device:").grid(row=row, column=0, sticky=tk.W, pady=5)
+        printer_label_text = "Printer Device:" if platform.system() != 'Windows' else "Printer Name:"
+        help_text = " (e.g., /dev/usb/lp0)" if platform.system() != 'Windows' else " (e.g., Thermal Printer)"
+        ttk.Label(controls_frame, text=printer_label_text + help_text).grid(row=row, column=0, sticky=tk.W, pady=5)
         self.printer_path_var = tk.StringVar(value=PRINTER)
         ttk.Entry(controls_frame, textvariable=self.printer_path_var, width=25).grid(
             row=row, column=1, sticky=(tk.W, tk.E), pady=5)
@@ -489,7 +573,22 @@ class BarcodePrinterGUI:
                 return
             
             # Check if running in dry-run mode
-            dry_run = not os.path.exists(printer_path)
+            if platform.system() == 'Windows':
+                # Windows: Check if printer exists by trying to open it
+                try:
+                    import win32print
+                    printers = [p[2] for p in win32print.EnumPrinters(win32print.PRINTER_ENUM_LOCAL)]
+                    dry_run = printer_path not in printers
+                except ImportError:
+                    # If win32print not available, assume dry run
+                    dry_run = True
+                except:
+                    # If check fails, assume dry run
+                    dry_run = True
+            else:
+                # Linux/Unix: Check if device file exists
+                dry_run = not os.path.exists(printer_path)
+            
             if dry_run:
                 messagebox.showwarning(
                     "Dry Run Mode",
